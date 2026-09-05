@@ -10459,7 +10459,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     if (!window.isSecureContext) {
       $('status').textContent = '页面不是安全上下文，相机可能无法启动';
       $('error').textContent =
-        '若相机/校验失败：1) 通过 https 打开本页（机器 B 运行 qrmover serve 后访问 https://B的内网IP:8000/phone.html，证书警告点“高级→继续访问”）；' +
+        '若相机/校验失败：1) 用 https 地址打开本页（iPhone 用已发布地址 https://vsxhu.github.io/qrmove-static/phone.html）；' +
         '2) 或先在浏览器“网站设置”里给本页授权相机。';
     }
     if (!('DecompressionStream' in window)) {
