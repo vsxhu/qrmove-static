@@ -45,7 +45,7 @@ button:active{background:#354052}
     <div class="title">传输完成</div>
     <div class="muted" id="done-info"></div>
   </div>
-  <button id="btn-restart" hidden>重新开始</button>
+  <button id="btn-restart">重置并重新接收</button>
 </div>
 
 <script>(function webpackUniversalModuleDefinition(root, factory) {
@@ -10399,7 +10399,6 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     $('status').textContent = '完成！';
     $('done').style.display = 'block';
     $('done-info').textContent = prefix + name;
-    $('btn-restart').hidden = false;
   }
   function onComplete() {
     if (doneFlag) return;
