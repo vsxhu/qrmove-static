@@ -39,7 +39,7 @@ button:active{background:#354052}
 <div class="panel">
   <div class="bar"><div id="fill"></div></div>
   <div id="status">尚未开始</div>
-  <div class="muted">提示：让二维码完整、大致方正地出现在画面中；缺帧时会提示还差几帧</div>
+  <div class="muted">提示：让二维码完整、大致方正地出现在画面中；有冗余校验，个别帧扫不到也能重组</div>
   <div id="error"></div>
   <div id="done">
     <div class="title">传输完成</div>
@@ -10159,7 +10159,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
   const INTERVAL = 120;       // 识别一帧的间隔 ms
   const TARGET_WIDTH = 720;   // 识别时下采样到的宽度
 
-  /* ---------- 帧格式：QRMV1|total|idx|complen|sha256hex|nameb64|crc32hex|chunkb64 ---------- */
+  /* ---------- 帧格式：QRMV2|n|p|symlen|groups|complen|sha256hex|nameb64|crc32hex|symb64|symidx ---------- */
 
   const CRC_TABLE = (function () {
     const t = new Int32Array(256);
@@ -10182,33 +10182,141 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     return u;
   }
   function parsePayload(text) {
-    if (typeof text !== 'string' || !text.startsWith('QRMV1|')) return null;
+    if (typeof text !== 'string' || !text.startsWith('QRMV2|')) return null;
     const p = text.split('|');
-    if (p.length !== 8) return null;
-    const total = Number(p[1]), idx = Number(p[2]), complen = Number(p[3]);
-    const sha = p[4], crc = p[6];
-    if (!Number.isInteger(total) || !Number.isInteger(idx) || !Number.isInteger(complen)) return null;
-    if (!(idx >= 0 && idx < total)) return null;
+    if (p.length !== 11) return null;
+    const n = Number(p[1]), par = Number(p[2]), symlen = Number(p[3]),
+          groups = Number(p[4]), complen = Number(p[5]);
+    const sha = p[6], crc = p[8], sym = Number(p[10]);
+    if (![n, par, symlen, groups, complen, sym].every(Number.isInteger)) return null;
+    if (n < 1 || par < 0 || symlen < 1 || groups < 1 || complen < 0) return null;
+    if (!(sym >= 0 && sym < groups * (n + par))) return null;
     let name, chunk;
     try {
-      name = new TextDecoder().decode(b64toBytes(p[5]));
-      chunk = b64toBytes(p[7]);
+      name = new TextDecoder().decode(b64toBytes(p[7]));
+      chunk = b64toBytes(p[9]);
     } catch (e) { return null; }
+    if (chunk.length !== symlen) return null;
     if (crc32(chunk).toString(16).padStart(8, '0') !== crc) return null; // 结构合法但内容损坏的坏帧
-    return { total: total, idx: idx, complen: complen, sha: sha, name: name, chunk: chunk };
+    return { n: n, par: par, symlen: symlen, groups: groups, complen: complen,
+             sha: sha, name: name, sym: sym, chunk: chunk };
   }
 
-  /* ---------- 按序号去重重组（每帧自带会话信息，可自愈） ---------- */
+  /* ---------- GF(2^8) + Reed-Solomon 块级冗余（Cauchy 构造，与 Python codec 一致） ---------- */
 
-  const chunks = new Map();
-  let meta = null; // {total, complen, sha, name} 从第一帧学习，之后校验一致才收
+  const GF = (function () {
+    const exp = new Uint8Array(512), log = new Uint8Array(256);
+    let x = 1;
+    for (let i = 0; i < 255; i++) { exp[i] = x; log[x] = i; x <<= 1; if (x & 0x100) x ^= 0x11D; }
+    for (let i = 255; i < 512; i++) exp[i] = exp[i - 255];
+    return { exp: exp, log: log };
+  })();
+  function gfMul(a, b) { return (a && b) ? GF.exp[GF.log[a] + GF.log[b]] : 0; }
+  function gfInv(a) { return GF.exp[255 - GF.log[a]]; }
+  let mulTab = null;
+  function gfTab() {
+    if (!mulTab) { // 256 张乘表，构建一次复用
+      mulTab = new Array(256);
+      for (let a = 0; a < 256; a++) {
+        const t = new Uint8Array(256);
+        for (let b = 0; b < 256; b++) t[b] = gfMul(a, b);
+        mulTab[a] = t;
+      }
+    }
+    return mulTab;
+  }
+  function gfInvert(M, n) {
+    // 增广 [M|I] 高斯-约当消元（GF(2^8)，加/减即 XOR）
+    const w = 2 * n;
+    const a = new Uint8Array(n * w);
+    for (let i = 0; i < n; i++) { a.set(M.subarray(i * n, i * n + n), i * w); a[i * w + n + i] = 1; }
+    for (let col = 0; col < n; col++) {
+      let piv = -1;
+      for (let r = col; r < n; r++) if (a[r * w + col]) { piv = r; break; }
+      if (piv < 0) throw new Error('RS 矩阵不可逆');
+      if (piv !== col) for (let j = 0; j < w; j++) { const t = a[col * w + j]; a[col * w + j] = a[piv * w + j]; a[piv * w + j] = t; }
+      const invd = gfInv(a[col * w + col]);
+      for (let j = 0; j < w; j++) a[col * w + j] = a[col * w + j] ? gfMul(a[col * w + j], invd) : 0;
+      for (let r = 0; r < n; r++) {
+        if (r === col) continue;
+        const f = a[r * w + col];
+        if (!f) continue;
+        const lf = GF.log[f];
+        for (let j = 0; j < w; j++) {
+          const v = a[col * w + j];
+          if (v) a[r * w + j] ^= GF.exp[lf + GF.log[v]];
+        }
+      }
+    }
+    const inv = new Uint8Array(n * n);
+    for (let i = 0; i < n; i++) inv.set(a.subarray(i * w + n, i * w + w), i * n);
+    return inv;
+  }
+  // 由 ≥n 个 (组内偏移, 符号) 解出 n 个原块：原块全在时直接返回（零解码成本），
+  // 缺原块时用校验块补足 n 行，构造系数矩阵求逆后做 GF 矩阵乘。
+  function rsDecodeGroup(rec, n, symlen) {
+    const originals = new Array(n).fill(null);
+    const parities = [];
+    for (let i = 0; i < rec.length; i++) {
+      if (rec[i].off < n) originals[rec[i].off] = rec[i].data;
+      else parities.push(rec[i]);
+    }
+    if (originals.every(function (b) { return b !== null; })) return originals;
+    const rows = [];
+    for (let i = 0; i < n; i++) if (originals[i] !== null) rows.push({ off: i, data: originals[i] });
+    for (let i = 0; rows.length < n; i++) rows.push(parities[i]);
+    const M = new Uint8Array(n * n);
+    for (let r = 0; r < n; r++) {
+      const off = rows[r].off;
+      if (off < n) M[r * n + off] = 1;
+      else for (let c = 0; c < n; c++) M[r * n + c] = gfInv(c ^ off); // 校验符号 off 中原块 c 的系数
+    }
+    const Minv = gfInvert(M, n);
+    const tab = gfTab();
+    const out = new Array(n);
+    for (let c = 0; c < n; c++) {
+      const acc = new Uint8Array(symlen);
+      for (let r = 0; r < n; r++) {
+        const coeff = Minv[c * n + r];
+        if (!coeff) continue;
+        const t = tab[coeff], d = rows[r].data;
+        for (let k = 0; k < symlen; k++) acc[k] ^= t[d[k]];
+      }
+      out[c] = acc;
+    }
+    return out;
+  }
+
+  /* ---------- 按组去重收集符号（每帧自带会话信息，可自愈） ---------- */
+
+  const syms = new Map(); // 全局符号序号 -> 符号字节
+  let meta = null; // {n, par, symlen, groups, complen, sha, name} 从第一帧学习，之后校验一致才收
   function addFrame(f) {
     if (meta === null) meta = f;
-    else if (meta.total !== f.total || meta.complen !== f.complen ||
+    else if (meta.n !== f.n || meta.par !== f.par || meta.symlen !== f.symlen ||
+             meta.groups !== f.groups || meta.complen !== f.complen ||
              meta.sha !== f.sha || meta.name !== f.name) return false; // 混入别的会话
-    if (chunks.has(f.idx)) return false;
-    chunks.set(f.idx, f.chunk);
+    if (syms.has(f.sym)) return false;
+    syms.set(f.sym, f.chunk);
     return true;
+  }
+  function totalSymbols() { return meta ? meta.groups * (meta.n + meta.par) : 0; }
+  function groupCounts() {
+    const cnt = new Array(meta.groups).fill(0);
+    syms.forEach(function (v, sym) { cnt[Math.floor(sym / (meta.n + meta.par))]++; });
+    return cnt;
+  }
+  function isComplete() {
+    if (!meta) return false;
+    const cnt = groupCounts();
+    for (let g = 0; g < meta.groups; g++) if (cnt[g] < meta.n) return false;
+    return true;
+  }
+  function missingCount() {
+    const cnt = groupCounts();
+    let left = 0;
+    for (let g = 0; g < meta.groups; g++) if (cnt[g] < meta.n) left += meta.n - cnt[g];
+    return left;
   }
 
   /* ---------- 完整性校验 + 解压 ---------- */
@@ -10225,15 +10333,17 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     return new Uint8Array(await stream.arrayBuffer());
   }
   async function assemble() {
-    if (!meta || chunks.size < meta.total) return null;
-    const compressed = new Uint8Array(meta.complen);
-    let off = 0;
-    for (let i = 0; i < meta.total; i++) {
-      const c = chunks.get(i);
-      if (!c) return null;
-      compressed.set(c, off);
-      off += c.length;
+    if (!isComplete()) return null;
+    const n = meta.n, symlen = meta.symlen, groups = meta.groups, spg = n + meta.par;
+    const padded = new Uint8Array(groups * n * symlen);
+    const byGroup = [];
+    for (let g = 0; g < groups; g++) byGroup.push([]);
+    syms.forEach(function (data, sym) { byGroup[Math.floor(sym / spg)].push({ off: sym % spg, data: data }); });
+    for (let g = 0; g < groups; g++) {
+      const originals = rsDecodeGroup(byGroup[g], n, symlen);
+      for (let i = 0; i < n; i++) padded.set(originals[i], (g * n + i) * symlen);
     }
+    const compressed = padded.subarray(0, meta.complen);
     if (await sha256Hex(compressed) !== meta.sha) throw new Error('sha256 校验失败，会话被污染，请重新开始');
     return inflateRaw(compressed);
   }
@@ -10367,9 +10477,9 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     const pct = total > 0 ? Math.round(recv * 100 / total) : 0;
     $('fill').style.width = pct + '%';
     if (total > 0) {
-      const left = total - recv;
-      $('status').innerHTML = '已接收 <b>' + recv + '</b> / <b>' + total + '</b> 帧（' + pct + '%）' +
-        (left > 0 ? '<br><span class="muted">还差 ' + left + ' 帧，继续对准机器 A 的屏幕</span>' : '');
+      const left = meta ? missingCount() : total - recv;
+      $('status').innerHTML = '已接收 <b>' + recv + '</b> / <b>' + total + '</b> 符号（' + pct + '%）' +
+        (left > 0 ? '<br><span class="muted">还差 ' + left + ' 个符号，继续对准机器 A 的屏幕</span>' : '');
     } else {
       $('status').textContent = '正在扫描…（对准屏幕上循环播放的二维码）';
     }
@@ -10409,7 +10519,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     Promise.resolve().then(function () {
       return assemble();
     }).then(function (data) {
-      if (!data) { fail('数据不完整，还差帧'); return; }
+      if (!data) { fail('数据不完整，还差符号'); return; }
       if (!isDir) {
         saveBlob(data, display);
         showDone('文件已保存到手机：', display);
@@ -10430,8 +10540,8 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     if (doneFlag) return;
     const f = parsePayload(text);
     if (!f || !addFrame(f)) return;
-    setProgress(chunks.size, f.total);
-    if (chunks.size >= f.total) onComplete();
+    setProgress(syms.size, totalSymbols());
+    if (isComplete()) onComplete();
   }
   async function tick() {
     const vw = video.videoWidth, vh = video.videoHeight;
